@@ -1,0 +1,15 @@
+# Tooling configuration for Yaragon (Linux-only). Runtime dependencies are
+# declared in requirements.txt (and requirements-dev.txt for the test tools) so
+# the install.sh shell installer stays simple; this file only configures tools.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]

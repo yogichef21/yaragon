@@ -1,0 +1,26 @@
+# Keep the build context small and reproducible.
+.venv/
+venv/
+*-venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+*.sqlite3
+*.log
+*.png
+*.jpeg
+*.jpg
+.git/
+.gitignore
+docs/_build/
+build/
+dist/
+*.egg-info/
+.idea/
+.vscode/
+# Local exports / scratch
+yaragon_session.*
+scratchpad/

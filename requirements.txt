@@ -1,0 +1,6 @@
+# Yaragon runtime dependencies (Linux; Python 3.10+, developed on 3.12).
+# Constrained to current stable, actively maintained releases.
+# System packages (libpcap, iproute2, Qt xcb libs) are installed by install.sh.
+
+PySide6>=6.7,<6.13      # Qt 6 GUI (stable LTS-track releases)
+scapy>=2.5,<3.0         # packet capture + protocol dissection

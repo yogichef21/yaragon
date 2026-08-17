@@ -1,0 +1,53 @@
+# Yaragon - Docker Compose deployment for Linux.
+#
+# Networking design (important):
+#   network_mode: host
+#     A normal Docker bridge network gives the container its OWN isolated
+#     network namespace, so it would only ever see NAT'd/bridge traffic - not
+#     the real lab segment. Yaragon must observe the actual host interfaces to
+#     discover hosts, capture frames and run the ARP lab. Host networking puts
+#     the container in the host's network namespace so `ip`, interface
+#     discovery, capture and ARP all work exactly as they do natively.
+#
+#   cap_add: NET_RAW, NET_ADMIN   (instead of the blunt `privileged: true`)
+#     NET_RAW   -> open raw / AF_PACKET sockets: packet capture + ARP frames.
+#     NET_ADMIN -> toggle net.ipv4.ip_forward for transparent lab MITM and
+#                  read/adjust interface state.
+#     This is the minimum required; we deliberately avoid --privileged.
+#
+#   GUI: the X11 socket and DISPLAY are shared in so the PySide6 window renders
+#     on the host's display. On the host first run:  xhost +local:root
+#
+services:
+  yaragon:
+    build: .
+    image: yaragon:latest
+    container_name: yaragon
+    # See note above - required for real lab traffic visibility.
+    network_mode: host
+    cap_add:
+      - NET_RAW      # packet capture + ARP (raw sockets)
+      - NET_ADMIN    # ip_forward toggle for lab MITM, interface state
+    # No `privileged: true` - the two capabilities above are sufficient.
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_QPA_PLATFORM=xcb
+      - XDG_RUNTIME_DIR=/tmp/runtime-root
+    volumes:
+      # Share the host X11 display so the GUI can render.
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # Optional: share the Xauthority for stricter X setups.
+      - ${XAUTHORITY:-/dev/null}:/root/.Xauthority:ro
+      # Persist Yaragon config, logs and session database on the host.
+      - yaragon-data:/root/.local/share/yaragon
+      - yaragon-config:/root/.config/yaragon
+    stdin_open: true
+    tty: true
+    # Default command launches the GUI; override for other modes, e.g.:
+    #   docker compose run --rm yaragon check
+    #   docker compose run --rm yaragon test
+    command: ["gui"]
+
+volumes:
+  yaragon-data:
+  yaragon-config:
