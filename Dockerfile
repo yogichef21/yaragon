@@ -12,7 +12,7 @@ FROM python:3.12-slim-bookworm
 LABEL org.opencontainers.image.title="Yaragon" \
       org.opencontainers.image.description="Offensive security MITM tool for authorized network investigation (isolated-lab use)" \
       org.opencontainers.image.version="1.0.0" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="LicenseRef-Yaragon-Source-Available-1.0"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

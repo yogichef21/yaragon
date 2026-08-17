@@ -57,15 +57,13 @@ def test_raw_bytes_captured_for_inspector(parser):
     assert isinstance(rec.raw, bytes) and len(rec.raw) == rec.length
 
 
-def test_hexdump_and_ascii_helpers():
-    from yaragon.analysis.model import ascii_view, hexdump
+def test_hexdump_helper():
+    from yaragon.analysis.model import hexdump
     data = bytes(range(0, 32))
     dump = hexdump(data)
     assert "00000000" in dump                 # offset column
     assert "00 01 02 03" in dump               # hex column
     assert hexdump(b"") == "(no bytes captured)"
-    av = ascii_view(b"AB\x00\x01CD")
-    assert av == "AB..CD"                       # non-printables become '.'
 
 
 def test_tcp_flags_string(parser):

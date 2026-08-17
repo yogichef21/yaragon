@@ -62,6 +62,19 @@ ICMP_TYPES = {
 }
 
 
+def detail_tree_from_raw(raw: bytes) -> List[DetailNode]:
+    """Rebuild the decoded OSI tree for a single frame on demand (the inspector
+    calls this for the one selected packet, so the live path can skip building
+    and retaining a tree for every captured frame)."""
+    if not raw:
+        return []
+    try:
+        from scapy.layers.l2 import Ether
+        return PacketParser().parse(Ether(raw), build_tree=True).detail_tree
+    except Exception:
+        return []
+
+
 def l4_payload(layer) -> bytes:
     """Return a transport layer's real payload, excluding any trailing Ethernet
     padding scapy attaches to short frames (so payload lengths stay accurate)."""
@@ -95,7 +108,15 @@ def tcp_flags_expand(flags_int: int) -> str:
 class PacketParser:
     """Stateless parser (thread-safe): call :meth:`parse` per frame."""
 
-    def parse(self, pkt: Packet, number: int = 0) -> PacketRecord:
+    def parse(self, pkt: Packet, number: int = 0,
+              build_tree: bool = True) -> PacketRecord:
+        """Normalise a frame into a PacketRecord.
+
+        With ``build_tree=False`` the cheap summary (protocol / info / meta /
+        addresses / ports / TCP seq) is still extracted, but the heavy nested
+        inspector tree is NOT built or retained - the live path uses this so a
+        20k-record history stays cheap; the inspector rebuilds the tree on demand
+        from ``rec.raw`` via :func:`detail_tree_from_raw`."""
         rec = PacketRecord(number=number)
         try:
             rec.timestamp = float(pkt.time)
@@ -106,8 +127,8 @@ class PacketParser:
         except Exception:
             rec.length = 0
         try:
-            # Full frame bytes for the inspector's Hex/ASCII/Raw views.
-            # In-memory only (bounded history); not persisted or exported.
+            # Full frame bytes for the inspector's Hex view and Follow Stream.
+            # In-memory only (bounded history); not persisted unless exported.
             rec.raw = bytes(pkt)
         except Exception:
             rec.raw = b""
@@ -132,7 +153,8 @@ class PacketParser:
         # ---- ARP ---------------------------------------------------------
         if pkt.haslayer(ARP):
             self._parse_arp(pkt[ARP], rec, tree)
-            rec.detail_tree = tree
+            if build_tree:
+                rec.detail_tree = tree
             return rec
 
         # ---- Network layer ----------------------------------------------
@@ -160,7 +182,11 @@ class PacketParser:
         if not rec.info:
             rec.info = f"{rec.protocol} {rec.src_socket} → {rec.dst_socket}"
 
-        rec.detail_tree = tree
+        # Retain the heavy tree only when asked. The live path passes
+        # build_tree=False, so a 20k-record history holds summaries, not 20k
+        # nested trees; the inspector rebuilds one on demand from rec.raw.
+        if build_tree:
+            rec.detail_tree = tree
         return rec
 
     # ------------------------------------------------------------------ ARP

@@ -1,30 +1,76 @@
-MIT License
+Yaragon Source-Available License
+Version 1.0
 
-Copyright (c) 2026 Yaragon Lab
+Copyright (c) 2026 Yogev Tehen. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This is a SOURCE-AVAILABLE license. It is NOT an Open Source license as defined
+by the Open Source Initiative, and it is NOT the MIT License. The source code is
+published so it can be read, studied, and used for the purposes granted below;
+some rights that Open Source licenses grant (notably unrestricted commercial
+redistribution) are intentionally withheld.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. Definitions
+   "Software" means the Yaragon source code, assets, and documentation in this
+   repository. "You" means the individual or entity exercising rights under this
+   license. "Authorized security testing" means testing only against networks and
+   systems that you own or are explicitly permitted in writing to test.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+2. Grant of rights
+   Subject to the conditions and restrictions below, you are granted a
+   non-exclusive, worldwide, royalty-free license to:
+   a. access, read, and study the Software;
+   b. use and run the Software for personal, educational, academic, and
+      security-research purposes;
+   c. use and run the Software for authorized security testing;
+   d. modify the Software and create derivative works for the purposes in (b)
+      and (c); and
+   e. share your modifications for those same non-commercial purposes, provided
+      this license and the copyright notice are retained.
+
+3. Restrictions
+   a. Commercial redistribution of the Software, or of a substantially modified
+      derivative, is NOT automatically permitted. Selling the Software, offering
+      it as a paid product or paid service, or bundling it into a commercial
+      offering requires prior written permission from the copyright holder.
+   b. The names "Yaragon" and any Yaragon logos or marks are NOT licensed by this
+      document. You may not use them to name, brand, or promote another product,
+      service, or distribution without permission.
+   c. A modified version must not be presented as the official Yaragon project.
+      Clearly state that it is an unofficial, modified build and do not imply
+      endorsement by the copyright holder.
+   d. You must not remove or obscure this license or the copyright notice.
+
+4. Reservation of rights
+   All rights not expressly granted here are reserved by the copyright holder.
+   For permissions beyond this license (including commercial use or
+   redistribution), contact the copyright holder.
+
+5. No warranty
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER
+   IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN
+   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+6. Third-party components
+   The Software depends on third-party components (for example Python, PySide6/Qt,
+   and Scapy) that are distributed under their own licenses. This license does not
+   modify or supersede those licenses, which continue to govern their respective
+   components.
+
+7. Legal note
+   This is a project-specific source-available license, not a standard or
+   OSI-approved one. It is provided in good faith and is not legal advice. Have it
+   reviewed by qualified legal counsel before relying on it for commercial
+   enforcement or use.
 
 ------------------------------------------------------------------------------
 RESPONSIBLE USE
 
-Yaragon is an educational/defensive network-analysis tool. It is intended to
-be used ONLY on networks and systems that you own or are explicitly authorized
-to test, within an isolated laboratory environment. The authors do not condone
-and are not responsible for any misuse. Using Yaragon to intercept or disrupt
-traffic on networks you do not own or have permission to test may be illegal.
+Yaragon is an offensive-security tool for authorized MITM network investigation.
+Use it ONLY on networks and systems that you own or are explicitly authorized to
+test, ideally within an isolated laboratory environment. The author does not
+condone and is not responsible for any misuse. Using Yaragon to intercept or
+disrupt traffic on networks you do not own or have permission to test may be
+illegal.

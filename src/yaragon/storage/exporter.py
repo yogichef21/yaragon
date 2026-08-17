@@ -65,7 +65,10 @@ def import_pcap(path: str, max_frames: int = 20000) -> List[PacketRecord]:
             # live engine, which drops a bad frame and keeps going. Numbering
             # stays gap-free over the frames that did parse.
             try:
-                rec = parser.parse(frame)
+                # build_tree=False mirrors the live path: keep the cheap summary,
+                # let the inspector rebuild one frame's tree on demand. Avoids
+                # materialising a full tree for every frame of a large import.
+                rec = parser.parse(frame, build_tree=False)
                 rec.number = len(records) + 1
                 try:
                     rec.timestamp = float(frame.time)

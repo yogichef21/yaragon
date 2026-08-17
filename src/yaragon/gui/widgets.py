@@ -30,6 +30,37 @@ def brand_mark_path() -> Optional[str]:
     return str(p) if p and p.exists() else None
 
 
+def sample_pcap_path() -> Optional[str]:
+    """Path to the bundled sample capture (for the first-run 'Load sample')."""
+    d = _assets_dir()
+    p = d / "samples" / "yaragon-sample.pcap" if d else None
+    return str(p) if p and p.exists() else None
+
+
+def brand_mark_pixmap(size: int = 22, color: Optional[str] = None) -> Optional[QPixmap]:
+    """Render the mark to a transparent pixmap with ``currentColor`` resolved to
+    *color* (defaults to the theme text colour). Without this, QSvgRenderer draws
+    the ``currentColor`` linework as black - invisible on the ink rail - leaving
+    only the amber centre node, which collapses the MITM-junction concept."""
+    path = brand_mark_path()
+    if not path:
+        return None
+    from PySide6.QtSvg import QSvgRenderer
+    ink = color or PALETTE["text"]
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            svg = fh.read().replace("currentColor", ink)
+        renderer = QSvgRenderer(bytearray(svg, "utf-8"))
+    except Exception:
+        renderer = QSvgRenderer(path)
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    renderer.render(painter)
+    painter.end()
+    return pix
+
+
 class Card(QFrame):
     """A titled surface panel."""
 
@@ -126,7 +157,7 @@ class EmptyState(QWidget):
 
     def __init__(self, title: str, body: str = "", icon: str = "◫",
                  error: bool = False, action_text: str = "", on_action=None,
-                 parent=None):
+                 action2_text: str = "", on_action2=None, parent=None):
         super().__init__(parent)
         lay = QVBoxLayout(self)
         lay.setAlignment(Qt.AlignCenter)
@@ -143,12 +174,18 @@ class EmptyState(QWidget):
         lay.addWidget(ic); lay.addWidget(t)
         if body:
             lay.addWidget(b)
-        if action_text and on_action is not None:
+        if (action_text and on_action is not None) or (action2_text and on_action2):
             row = QHBoxLayout(); row.setAlignment(Qt.AlignCenter)
-            self.action_btn = QPushButton(action_text)
-            self.action_btn.setObjectName("Ghost")
-            self.action_btn.clicked.connect(on_action)
-            row.addWidget(self.action_btn)
+            if action_text and on_action is not None:
+                self.action_btn = QPushButton(action_text)
+                self.action_btn.setObjectName("Ghost")
+                self.action_btn.clicked.connect(on_action)
+                row.addWidget(self.action_btn)
+            if action2_text and on_action2 is not None:
+                self.action2_btn = QPushButton(action2_text)
+                self.action2_btn.setObjectName("Ghost")
+                self.action2_btn.clicked.connect(on_action2)
+                row.addWidget(self.action2_btn)
             lay.addLayout(row)
 
 
@@ -231,19 +268,16 @@ class StageRail(QFrame):
         row = QHBoxLayout(box)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
-        mark = brand_mark_path()
-        if mark:
-            from PySide6.QtSvg import QSvgRenderer
-            renderer = QSvgRenderer(mark)
-            pix = QPixmap(22, 22)
-            pix.fill(Qt.transparent)
-            painter = QPainter(pix)
-            renderer.render(painter)
-            painter.end()
+        pix = brand_mark_pixmap(22)
+        if pix is not None:
             ic = QLabel(); ic.setPixmap(pix)
             row.addWidget(ic)
         word = QLabel("YARAGON"); word.setObjectName("Wordmark")
         row.addWidget(word)
+        # A quiet descriptor so the (deliberately opaque) name is legible on first
+        # contact - this is what the tool IS, not a tagline.
+        desc = QLabel("NETWORK INVESTIGATION"); desc.setObjectName("WordmarkSub")
+        row.addWidget(desc)
         return box
 
     def add_trailing(self, widget: QWidget) -> None:

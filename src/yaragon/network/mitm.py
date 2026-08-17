@@ -85,6 +85,16 @@ class MitmController:
         # degrades. The GUI wires this to a queued Qt signal so it can surface a
         # visible DEGRADED state. Qt-free by design - this is a plain callable.
         self.on_degraded: Optional[Callable[[], None]] = None
+        # Optional callback fired (on the spoof thread) if the loop exits
+        # unexpectedly and self-heals. The GUI wires this to a queued signal so it
+        # can leave the ACTIVE readout - a torn-down session must never keep
+        # claiming ACTIVE. Qt-free by design.
+        self.on_thread_exit: Optional[Callable[[], None]] = None
+        # Whether the most recent teardown restored the network cleanly. A MITM
+        # safety tool must never claim "restored" when a restore actually failed,
+        # so stop()/self-heal record this and the GUI surfaces it honestly.
+        self.last_restore_ok: bool = True
+        self.last_restore_error: str = ""
         # Guarantee ARP/forwarding restoration even on abnormal exit so we never
         # leave the LAN poisoned. stop() is idempotent, so this is safe to call
         # unconditionally at interpreter shutdown.
@@ -154,6 +164,16 @@ class MitmController:
             failed = [n for n, p, _ in res.checks if not p]
             raise ValueError(
                 "Refusing to start MITM - invalid target set: " + "; ".join(failed))
+
+        # Fail closed if the host will not actually relay the forwarded traffic.
+        # ip_forward=1 alone is not enough: a netfilter FORWARD policy of DROP
+        # (ufw / firewalld / a Docker host) would black-hole the target. Refuse
+        # BEFORE any ARP is resolved or sent, rather than create a broken
+        # interception state the operator can't see.
+        if self.manage_forwarding:
+            pre = self.forwarding.preflight(iface.name)
+            if pre.blocked:
+                raise RuntimeError("Refusing to start MITM - " + pre.reason)
 
         # Blocking ARP resolution happens BEFORE taking the lock (start() runs on
         # a worker thread), so we never hold the lock across multi-second probes
@@ -239,6 +259,11 @@ class MitmController:
                     except Exception as exc:
                         log.debug("degraded callback failed: %s", exc)
                 self._stop.wait(interval)
+        except Exception as exc:
+            # An unexpected error (e.g. the interface vanished) must not crash the
+            # thread silently and leave the LAN poisoned - fall through to the
+            # self-heal in finally, which also notifies the GUI.
+            log.warning("Spoof loop crashed: %s", exc)
         finally:
             # If the loop exits for any reason other than an explicit stop()
             # (e.g. an unexpected error in the thread), heal the network so we
@@ -248,13 +273,24 @@ class MitmController:
             # rebind and stop() is idempotent, so this is safe.
             if not self._stop.is_set():
                 log.warning("Spoof loop exited unexpectedly - restoring ARP")
+                restore_ok = True
+                fwd_result = None
                 try:
-                    self._restore(s)
+                    restore_ok = self._restore(s)
                     if self.manage_forwarding:
-                        self.forwarding.restore()
+                        fwd_result = self.forwarding.restore()
                 finally:
                     if self._session is s:
                         self._session = None
+                    self._record_restore(restore_ok, fwd_result)
+                    # Tell the GUI the session is gone so the readout leaves
+                    # ACTIVE. Fired only on the UNEXPECTED path - a clean stop()
+                    # updates the GUI through its own worker.
+                    if self.on_thread_exit is not None:
+                        try:
+                            self.on_thread_exit()
+                        except Exception as cb_exc:
+                            log.debug("thread-exit callback failed: %s", cb_exc)
 
     def stop(self) -> None:
         with self._lock:
@@ -265,25 +301,57 @@ class MitmController:
             if self._thread is not None:
                 self._thread.join(timeout=5)
                 self._thread = None
-            self._restore(s)
-            if self.manage_forwarding:
-                self.forwarding.restore()
+            restore_ok = self._restore(s)
+            fwd_result = self.forwarding.restore() if self.manage_forwarding else None
             self._session = None
-            log.info("MITM stopped and ARP state restored")
+            self._record_restore(restore_ok, fwd_result)
+            if self.last_restore_ok:
+                log.info("MITM stopped and ARP state restored")
+            else:
+                log.warning("MITM stopped but network restore reported errors")
 
-    def _restore(self, s: MitmSession, rounds: int = 5) -> None:
-        """Re-ARP every endpoint with correct mappings to heal the network."""
+    def _restore(self, s: MitmSession, rounds: int = 5) -> bool:
+        """Re-ARP every endpoint with the correct mappings to heal the network.
+
+        Returns True only if every restore frame was sent without error. A
+        failure is never swallowed as success - the caller reports it so the
+        operator is never told "restored" when the LAN may still be poisoned.
+        Each send is guarded individually so one failure does not abort healing
+        the remaining endpoints."""
         try:
             from scapy.all import ARP, send
-
-            for _ in range(rounds):
-                for tip, tmac in s.targets:
+        except Exception as exc:
+            log.warning("ARP restore could not import scapy: %s", exc)
+            return False
+        ok = True
+        for _ in range(rounds):
+            for tip, tmac in s.targets:
+                try:
                     send(ARP(op=2, pdst=tip, hwdst=tmac,
                              psrc=s.gateway_ip, hwsrc=s.gateway_mac),
                          iface=s.iface, verbose=0, count=1)
+                except Exception as exc:
+                    ok = False
+                    log.warning("ARP restore (target %s) failed: %s", tip, exc)
+                try:
                     send(ARP(op=2, pdst=s.gateway_ip, hwdst=s.gateway_mac,
                              psrc=tip, hwsrc=tmac),
                          iface=s.iface, verbose=0, count=1)
-                time.sleep(0.2)
-        except Exception as exc:
-            log.warning("ARP restore failed: %s", exc)
+                except Exception as exc:
+                    ok = False
+                    log.warning("ARP restore (gateway for %s) failed: %s", tip, exc)
+            time.sleep(0.2)
+        return ok
+
+    _RESTORE_FAIL_MSG = (
+        "ARP or IP-forwarding restore did not complete cleanly - the target's "
+        "ARP cache may still point at this host. Verify the target and re-run "
+        "then stop MITM to re-assert the correct mappings.")
+
+    def _record_restore(self, restore_ok: bool, fwd_result) -> None:
+        """Fold the ARP-restore and forwarding-restore outcomes into the honest
+        last_restore_ok/error the GUI reads (forwarding controllers may return
+        None for 'no-op/unknown', treated as success)."""
+        fwd_ok = True if fwd_result is None else bool(fwd_result)
+        self.last_restore_ok = bool(restore_ok and fwd_ok)
+        self.last_restore_error = "" if self.last_restore_ok else self._RESTORE_FAIL_MSG

@@ -43,6 +43,8 @@ exports/
 captures/
 *.pcap
 *.pcapng
+# ...but the bundled sample capture IS part of the product (first-run experience).
+!assets/samples/yaragon-sample.pcap
 
 # Internal engineering-team working notes (not part of the product)
 .agents/

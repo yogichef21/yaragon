@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (QApplication, QLabel, QMenu, QPlainTextEdit,
 
 from ..analysis.model import PacketRecord, hexdump
 from ..analysis.osi import layer_for, layer_title
+from ..analysis.packet_parser import detail_tree_from_raw
 from .styles import FONT_MONO, PALETTE, PROTOCOL_COLORS
 from .widgets import EmptyState
 
@@ -153,7 +154,9 @@ class PacketInspector(QWidget):
             ("Epoch Time", f"{rec.timestamp:.6f}", []),
             ("Protocol", rec.protocol, []),
         ])]
-        nodes.extend(rec.detail_tree)
+        # Live records carry only a summary (lazy parsing); rebuild the decoded
+        # tree on demand from the frame bytes for the selected packet.
+        nodes.extend(rec.detail_tree or detail_tree_from_raw(rec.raw))
 
         buckets, order = {}, []
         for label, value, children in nodes:

@@ -408,18 +408,22 @@ def test_filter_empty_line_toggles(parser):
     assert view.filter_empty.isVisibleTo(view)
     view.clear_filters_btn.click()
     assert not view.filter_empty.isVisibleTo(view)
-    assert view.proxy.proto == "All"
+    assert view.proxy.protos == set()      # multi-select union cleared
     view.deleteLater()
 
 
-def test_empty_state_open_cta_fires(parser):
-    """A9: the packet-table empty state offers a clickable Open .pcap CTA."""
+def test_empty_state_ctas_fire(parser):
+    """A9: the packet-table empty state offers first-run CTAs - Load sample
+    (primary) and Open .pcap (secondary) - both clickable."""
     from yaragon.gui.traffic_view import TrafficView
     view = TrafficView(limit=100)
-    fired = []
-    view.open_requested.connect(lambda: fired.append(True))
+    sample = []; opened = []
+    view.sample_requested.connect(lambda: sample.append(True))
+    view.open_requested.connect(lambda: opened.append(True))
     view._empty.action_btn.click()
-    assert fired == [True]
+    view._empty.action2_btn.click()
+    assert sample == [True]
+    assert opened == [True]
     view.deleteLater()
 
 

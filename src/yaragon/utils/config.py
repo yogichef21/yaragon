@@ -41,9 +41,11 @@ class Config:
 
     # Capture / performance
     interface: str = ""
-    packet_history_limit: int = 20000          # bounded memory buffer
+    packet_history_limit: int = 20000          # bounded memory buffer; the packet
+                                               # table mirrors this exactly so a
+                                               # display filter never misses a
+                                               # packet the engine still holds
     gui_flush_interval_ms: int = 400           # GUI update batching cadence
-    max_rows_in_packet_table: int = 5000       # bounded live table
     capture_bpf_filter: str = ""               # optional BPF pre-filter
     max_capture_pps: int = 0                   # 0 = unlimited; else throttle
 

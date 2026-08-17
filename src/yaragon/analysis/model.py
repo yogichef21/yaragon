@@ -5,11 +5,12 @@ single object that flows from the capture worker through the analysis engine
 into the GUI.
 
 The full frame bytes are kept in ``raw`` (in memory only, bounded by the
-packet-history limit) so the inspector can show Hex/ASCII/Raw and so the capture
-can be exported to ``.pcap``. The curated *Decoded* view is credential-free by
-design - the HTTP parser drops ``Authorization``/``Cookie`` headers and shows
-only the query-free path. The full plaintext on the wire is still present in the
-Hex/ASCII/Raw views and in any exported ``.pcap``, exactly as with any analyzer.
+packet-history limit) so the inspector can show the Hex view and Follow Stream,
+and so the capture can be exported to ``.pcap``. The curated *Decoded* view is
+credential-free by design - the HTTP parser drops ``Authorization``/``Cookie``
+headers and shows only the query-free path. The full plaintext on the wire is
+still present in the Hex view and in any exported ``.pcap``, exactly as with any
+analyzer.
 """
 from __future__ import annotations
 
@@ -60,8 +61,8 @@ class PacketRecord:
     # Fully-built inspector tree (lazy; built by the parser on demand)
     detail_tree: List[DetailNode] = field(default_factory=list)
 
-    # Full frame bytes, kept in-memory only for the inspector's Hex/ASCII/Raw
-    # views and for .pcap export. Bounded by the packet-history limit.
+    # Full frame bytes, kept in-memory only for the inspector's Hex view, Follow
+    # Stream, and .pcap export. Bounded by the packet-history limit.
     raw: bytes = b""
 
     # ---- convenience ------------------------------------------------------
@@ -90,10 +91,3 @@ def hexdump(data: bytes, width: int = 16) -> str:
         ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
         lines.append(f"{off:08x}  {hex_part}  {ascii_part}")
     return "\n".join(lines)
-
-
-def ascii_view(data: bytes) -> str:
-    """Printable-ASCII rendering of raw bytes (non-printables shown as '.')."""
-    if not data:
-        return "(no bytes captured)"
-    return "".join(chr(b) if 32 <= b < 127 else "." for b in data)

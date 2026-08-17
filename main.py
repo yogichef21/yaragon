@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Yaragon - MITM Lab & Network Traffic Analyzer.
+"""Yaragon - Offensive Security MITM Investigation Tool.
 
 Entry point. Ensures the ``src`` package directory is importable whether the
 app is launched natively, from a venv, or inside the Docker image, then starts
 the PySide6 GUI.
 
-Authorized isolated-lab use only.
+For authorized security testing and learning only.
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def main() -> int:
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
     from yaragon.gui.main_window import MainWindow
-    from yaragon.gui.widgets import brand_mark_path
+    from yaragon.gui.widgets import brand_mark_pixmap
 
     config = Config.load()
     app = QApplication(sys.argv)
@@ -56,11 +56,17 @@ def main() -> int:
     # the window title, which duplicated the full product name in the title bar.
     # The window sets one clean, complete title itself.
     app.setOrganizationName("Yaragon Lab")
-    mark = brand_mark_path()
-    if mark:
-        app.setWindowIcon(QIcon(mark))
+    # Build the taskbar/tile icon with a mid-tone linework so the MITM-junction
+    # mark is legible on both light and dark backgrounds (the amber centre node
+    # reads on either); a bare currentColor SVG would render as invisible black.
+    icon_pix = brand_mark_pixmap(64, color="#8B98A5")
+    if icon_pix is not None:
+        app.setWindowIcon(QIcon(icon_pix))
 
     window = MainWindow(config)
+    # Restore ARP/forwarding on SIGINT/SIGTERM/SIGHUP too - atexit does not cover
+    # a kill / logout / terminal-close, which would otherwise leave the LAN poisoned.
+    window.install_signal_handlers()
     window.showMaximized()
     return app.exec()
 

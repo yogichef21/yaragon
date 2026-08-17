@@ -38,7 +38,8 @@ services:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       # Optional: share the Xauthority for stricter X setups.
       - ${XAUTHORITY:-/dev/null}:/root/.Xauthority:ro
-      # Persist Yaragon config, logs and session database on the host.
+      # Persist Yaragon config and logs on the host (Yaragon keeps no database;
+      # captures live in a bounded in-memory buffer and are exported on demand).
       - yaragon-data:/root/.local/share/yaragon
       - yaragon-config:/root/.config/yaragon
     stdin_open: true

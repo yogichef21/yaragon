@@ -112,7 +112,9 @@ def build_stylesheet() -> str:
     QFrame#StageRail {{ background: {p['bg_alt']};
                         border-bottom: 1px solid {p['border_sub']}; }}
     QLabel#Wordmark {{ font-size: 15px; font-weight: 600; color: {p['text']};
-                       letter-spacing: 1px; }}
+                       letter-spacing: 0.6px; }}
+    QLabel#WordmarkSub {{ font-size: 10px; font-weight: 600; color: {p['text_dim']};
+                         letter-spacing: 0.10em; padding-left: 6px; }}
     QPushButton#Stage {{
         text-align: left; padding: 6px 12px; border: none;
         border-radius: {RADIUS['sm']}px; background: transparent;

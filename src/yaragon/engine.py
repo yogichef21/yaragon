@@ -14,6 +14,9 @@ import threading
 from collections import deque
 from typing import Deque, Dict, List, Optional
 
+from .analysis.conversations import (Conversation, build_conversations,
+                                     endpoints)
+from .analysis.intel import TargetIntel, build_target_intel
 from .analysis.model import PacketRecord
 from .analysis.packet_parser import PacketParser
 from .utils.logging import get_logger
@@ -80,7 +83,10 @@ class AnalysisEngine:
         # number is assigned, so packet numbering never has gaps. The counter is
         # bumped and the record numbered under the history lock so a concurrent
         # clear() (which resets the counter) can never produce a duplicate number.
-        rec = self.parser.parse(pkt)
+        # build_tree=False: keep only the cheap summary for the 20k history; the
+        # inspector rebuilds the decoded tree on demand from rec.raw for the one
+        # packet the operator selects.
+        rec = self.parser.parse(pkt, build_tree=False)
         with self._history_lock:
             self._counter += 1
             rec.number = self._counter
@@ -106,6 +112,25 @@ class AnalysisEngine:
     def history(self) -> List[PacketRecord]:
         with self._history_lock:
             return list(self._history)
+
+    # ---- investigation queries (over the AUTHORITATIVE history) -------
+    # These run over the full bounded history, not the smaller display window,
+    # so search / follow / triage can never silently miss a packet the engine
+    # still holds. Each takes a consistent snapshot under the lock, then works on
+    # it lock-free.
+    def conversations(self) -> List[Conversation]:
+        """All flows in the resident history, heaviest first (triage order)."""
+        return build_conversations(self.history())
+
+    def conversation_packets(self, a: str, b: str) -> List[PacketRecord]:
+        """Every resident record whose endpoints are exactly {a, b}, in order."""
+        pair = frozenset((a, b))
+        return [r for r in self.history()
+                if frozenset(endpoints(r)) == pair]
+
+    def target_intel(self, host_ip: str) -> TargetIntel:
+        """Per-host rollup of already-parsed metadata over the full history."""
+        return build_target_intel(self.history(), host_ip)
 
     @property
     def total(self) -> int:

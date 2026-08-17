@@ -80,6 +80,19 @@ class NetCapabilities:
     notes: List[str] = field(default_factory=list)
 
 
+@dataclass
+class ForwardingPreflight:
+    """Result of checking whether the host will actually *relay* forwarded
+    traffic - not just whether ``ip_forward`` is 1. ``blocked`` means a positive
+    determination that the target would be black-holed (fail closed); ``ok`` is
+    False only then. ``checks`` is a list of (name, passed, detail) where passed
+    is True/False/None (None = could not verify)."""
+    ok: bool = True
+    blocked: bool = False
+    reason: str = ""
+    checks: List[tuple] = field(default_factory=list)
+
+
 class ForwardingController(ABC):
     """Controls IP forwarding while an authorized lab MITM is active."""
 
@@ -90,7 +103,15 @@ class ForwardingController(ABC):
     def enable(self) -> bool: ...
 
     @abstractmethod
-    def restore(self) -> None: ...
+    def restore(self) -> bool:
+        """Restore the original forwarding state. Return True on success; a
+        False/None means the caller must NOT report a clean teardown."""
+
+    def preflight(self, iface_name: str) -> ForwardingPreflight:
+        """Check the data-plane forwarding path before poisoning. Default is a
+        permissive 'unverified' result; platforms that can inspect the firewall
+        (Linux) override this to fail closed on a DROP policy."""
+        return ForwardingPreflight(ok=True, blocked=False)
 
     @property
     def supported(self) -> bool:
@@ -106,8 +127,8 @@ class NullForwarding(ForwardingController):
     def enable(self) -> bool:
         return False
 
-    def restore(self) -> None:
-        return None
+    def restore(self) -> bool:
+        return True
 
     @property
     def supported(self) -> bool:

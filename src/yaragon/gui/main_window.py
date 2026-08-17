@@ -13,8 +13,8 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal
-from PySide6.QtWidgets import (QFileDialog, QFrame, QHBoxLayout,
+from PySide6.QtCore import QObject, QSocketNotifier, QThread, QTimer, Signal
+from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QHBoxLayout,
                                QLabel, QMainWindow, QMessageBox,
                                QStackedWidget, QVBoxLayout, QWidget)
 
@@ -24,11 +24,15 @@ from ..network.capture import CaptureWorker
 from ..network.interfaces import InterfaceInfo, get_interface
 from ..network.mitm import MitmController
 from ..platform import get_platform
+from ..analysis.stream import reassemble
 from ..storage.exporter import export_pcap, import_pcap
 from ..utils.config import Config
 from ..utils.logging import get_logger
+from .conversations_view import ConversationsDialog
 from .discovery_view import DiscoveryView
+from .intel_view import TargetIntelDialog
 from .mitm_view import MitmView
+from .stream_view import FollowStreamDialog
 from .styles import PALETTE, build_stylesheet
 from .traffic_view import TrafficView
 from .widgets import LiveDot, StageRail, StatusPill
@@ -83,6 +87,15 @@ class _ReachabilityWorker(QObject):
         try:
             res = self.controller.reachability(self.iface, self.targets,
                                                self.gateway_ip)
+            # Also probe the data-plane forwarding path so the dry run reveals a
+            # black-hole risk (DROP FORWARD policy / strict rp_filter) before the
+            # operator commits to Start. Attached to the result, not fatal here.
+            try:
+                if self.controller.manage_forwarding:
+                    res.forwarding = self.controller.forwarding.preflight(
+                        self.iface.name)
+            except Exception:
+                pass
             self.done.emit(res, "")
         except Exception as exc:
             self.done.emit(None, str(exc))
@@ -102,7 +115,14 @@ class _MitmStopWorker(QObject):
     def run(self):
         try:
             self.controller.stop()
-            self.done.emit("")
+            # stop() does not raise on a restore failure (it must stay safe to
+            # call from atexit/signals); it records the outcome, which we surface
+            # here so the GUI never reports a clean teardown that did not happen.
+            if getattr(self.controller, "last_restore_ok", True):
+                self.done.emit("")
+            else:
+                self.done.emit(getattr(self.controller, "last_restore_error", "")
+                               or "Network restore did not complete cleanly.")
         except Exception as exc:
             self.done.emit(str(exc))
 
@@ -111,6 +131,9 @@ class MainWindow(QMainWindow):
     # Emitted (via a queued connection) when the MITM spoof thread reports the
     # session has degraded - crossing threads safely from the worker.
     mitm_degraded = Signal()
+    # Emitted when the spoof thread exits UNEXPECTEDLY and self-heals, so the GUI
+    # leaves the ACTIVE readout instead of lying about a torn-down session.
+    mitm_thread_exit = Signal()
 
     def __init__(self, config: Config):
         super().__init__()
@@ -131,6 +154,8 @@ class MainWindow(QMainWindow):
         self.gateway_ip = self.platform.default_gateway() or ""
         self.gateway_mac = ""
         self.targets: list = []   # list[(ip, mac)] chosen on Discover
+        # Live references to modeless investigation dialogs (so they aren't GC'd).
+        self._dialogs: set = set()
         # One honest source of truth for the guided stage rail.
         self.session = SessionState(current_stage=Stage.DISCOVER)
 
@@ -175,12 +200,17 @@ class MainWindow(QMainWindow):
         """A single window-level File menu - the home for the session-entry
         actions that do not belong on the Investigate lifecycle strip."""
         file_menu = self.menuBar().addMenu("&File")
-        act_open = file_menu.addAction("Open .pcap…")
+        act_open = file_menu.addAction("&Open .pcap…")
+        act_open.setShortcut("Ctrl+O")
         act_open.triggered.connect(self._open_pcap)
-        act_export = file_menu.addAction("Export .pcap…")
+        act_export = file_menu.addAction("&Export .pcap…")
+        act_export.setShortcut("Ctrl+E")
         act_export.triggered.connect(self._export_pcap)
+        act_sample = file_menu.addAction("Load &sample capture")
+        act_sample.triggered.connect(self._load_sample)
         file_menu.addSeparator()
-        act_quit = file_menu.addAction("Quit")
+        act_quit = file_menu.addAction("&Quit")
+        act_quit.setShortcut("Ctrl+Q")
         act_quit.triggered.connect(self.close)
 
     def _build_rail(self) -> QFrame:
@@ -200,8 +230,17 @@ class MainWindow(QMainWindow):
         # screen, where the packets it produces are shown.
         self.live_dot = LiveDot()
         self.capture_pill = StatusPill("IDLE", "off")
+        # Dropped-frame readout: hidden until the sniffer outruns the parser and
+        # drops frames, so an incomplete capture is never presented as complete.
+        self.dropped_lbl = QLabel("")
+        self.dropped_lbl.setStyleSheet(
+            f"color: {PALETTE['danger']}; font-weight: 700; font-size: 11px;")
+        self.dropped_lbl.setToolTip("Frames the sniffer dropped because capture "
+                                    "outran parsing - the capture is incomplete.")
+        self.dropped_lbl.hide()
         tb.addWidget(self.live_dot)
         tb.addWidget(self.capture_pill)
+        tb.addWidget(self.dropped_lbl)
         self.rail.add_trailing(readouts)
         return self.rail
 
@@ -227,7 +266,10 @@ class MainWindow(QMainWindow):
     def _build_views(self) -> None:
         self.discovery = DiscoveryView()
         self.mitm_view = MitmView()
-        self.traffic = TrafficView(self.config.max_rows_in_packet_table)
+        # The table mirrors the authoritative history so a display filter can
+        # never miss a packet the engine still holds (review W-D). The rows are
+        # references to the same PacketRecords the engine keeps - no duplication.
+        self.traffic = TrafficView(self.config.packet_history_limit)
         for v in (self.discovery, self.mitm_view, self.traffic):
             self.stack.addWidget(v)
 
@@ -242,12 +284,18 @@ class MainWindow(QMainWindow):
         # signal so the GUI update happens on the Qt thread (queued connection).
         self.mitm_degraded.connect(self._on_mitm_degraded)
         self.mitm.on_degraded = self.mitm_degraded.emit
+        self.mitm_thread_exit.connect(self._on_mitm_thread_exit)
+        self.mitm.on_thread_exit = self.mitm_thread_exit.emit
         self.traffic.start_requested.connect(self._capture_start)
         self.traffic.pause_requested.connect(self._capture_pause)
         self.traffic.stop_requested.connect(self._capture_stop)
         self.traffic.clear_requested.connect(self._clear_session)
         self.traffic.export_requested.connect(self._export_pcap)
         self.traffic.open_requested.connect(self._open_pcap)
+        self.traffic.conversations_requested.connect(self._open_conversations)
+        self.traffic.follow_stream_requested.connect(self._open_stream)
+        self.traffic.target_intel_requested.connect(self._open_target_intel)
+        self.traffic.sample_requested.connect(self._load_sample)
 
     def _goto(self, stage: Stage) -> None:
         """The single navigation chokepoint. Forward motion is driven by each
@@ -560,6 +608,16 @@ class MainWindow(QMainWindow):
             self.mitm_view.append_log(
                 f"  {'✓' if passed else '✗'} {name} - {detail}",
                 "ok" if passed else "warning")
+        pre = getattr(reach, "forwarding", None)
+        if pre is not None:
+            self.mitm_view.append_log("Forwarding path (relay must not be dropped):",
+                                      "accent")
+            for name, passed, detail in pre.checks:
+                mark = "✓" if passed else ("…" if passed is None else "✗")
+                color = "ok" if passed else "warning"
+                self.mitm_view.append_log(f"  {mark} {name} - {detail}", color)
+            if pre.blocked:
+                self.mitm_view.append_log("  ⚠ " + pre.reason, "anomaly")
 
     def _start_mitm(self, targets: list, gateway_ip: str) -> None:
         gateway_ip = gateway_ip or self.gateway_ip
@@ -653,20 +711,121 @@ class MainWindow(QMainWindow):
 
     def _on_mitm_stopped(self, error: str) -> None:
         if error:
-            self.mitm_view.append_log(f"Error during stop: {error}", "anomaly")
-        else:
-            self.mitm_view.append_log("MITM stopped. ARP + forwarding restored.", "ok")
+            # A cleanup failure is a network-safety problem - never hide it.
+            self.mitm_view.append_log(f"⚠ Error during stop: {error}", "anomaly")
+            self.strip_mitm.setText("CLEANUP FAILED")
+            self.strip_mitm.setStyleSheet(f"color: {PALETTE['danger']};")
+            QMessageBox.critical(
+                self, "Yaragon - cleanup failed",
+                "MITM teardown reported an error:\n\n" + error +
+                "\n\nThe network may not be fully restored. Verify the target's "
+                "ARP state; re-running and stopping MITM will re-assert the "
+                "correct mappings.")
+            self.mitm_view.set_active(False)
+            self.traffic.set_context(self.target_ips, self.gateway_ip, False)
+            self._refresh_stages()
+            return
+        self.mitm_view.append_log("MITM stopped. ARP + forwarding restored.", "ok")
         self.mitm_view.set_active(False)
         self.strip_mitm.setText("inactive")
         self.strip_mitm.setStyleSheet("")
         self.traffic.set_context(self.target_ips, self.gateway_ip, False)
         self._refresh_stages()
 
+    def _on_mitm_thread_exit(self) -> None:
+        """The spoof thread exited unexpectedly and self-healed. Leave the ACTIVE
+        readout and report honestly whether the restore actually succeeded."""
+        self.mitm_view.set_active(False)
+        self.traffic.set_context(self.target_ips, self.gateway_ip, False)
+        if getattr(self.mitm, "last_restore_ok", True):
+            self.mitm_view.append_log(
+                "⚠ MITM session ended unexpectedly - ARP + forwarding were "
+                "restored automatically. Re-start if you need to continue.",
+                "anomaly")
+            self.strip_mitm.setText("inactive")
+            self.strip_mitm.setStyleSheet("")
+        else:
+            self.mitm_view.append_log(
+                "⚠ MITM session ended unexpectedly AND cleanup failed - "
+                + getattr(self.mitm, "last_restore_error", ""), "anomaly")
+            self.strip_mitm.setText("CLEANUP FAILED")
+            self.strip_mitm.setStyleSheet(f"color: {PALETTE['danger']};")
+        self._refresh_stages()
+
+    def _load_sample(self) -> None:
+        """Load the bundled synthetic sample so a new user can explore the
+        inspector, search, conversations and follow-stream without a live MITM.
+        Clearly labelled as sample data - never presented as live traffic."""
+        from .widgets import sample_pcap_path
+        path = sample_pcap_path()
+        if not path:
+            QMessageBox.information(self, "Yaragon - sample",
+                                   "The bundled sample capture was not found.")
+            return
+        if self.capture is not None:
+            self._teardown_capture()
+            self._update_capture_ui()
+        try:
+            records = import_pcap(path, self.config.packet_history_limit)
+        except Exception as exc:
+            QMessageBox.critical(self, "Yaragon - sample",
+                                 f"Could not read the sample capture:\n{exc}")
+            return
+        self.engine.load_records(records)
+        self.traffic.clear()
+        self.traffic.append_batch(records)
+        self.session.mode = "offline"
+        self.traffic.set_capture_state("offline")
+        self.traffic.set_sample_loaded(len(records))
+        self._goto(Stage.INVESTIGATE)
+        self.statusBar().showMessage(f"Loaded {len(records)} sample packet(s) - "
+                                     "synthetic data for learning.")
+
+    # ------------------------------------------------- investigation
+    # These query the AUTHORITATIVE engine history (not the display window) and
+    # present it in a focused dialog - no new always-on panels on the heart screen.
+    def _show_modeless(self, dlg) -> None:
+        """Show a dialog modeless so the operator can keep cross-referencing the
+        packet table while a stream / profile / flow list is open. Hold a
+        reference so it isn't garbage-collected; drop it when closed."""
+        dlg.setModal(False)
+        self._dialogs.add(dlg)
+        dlg.finished.connect(lambda _=0, d=dlg: self._dialogs.discard(d))
+        dlg.show()
+        dlg.raise_()
+
+    def _open_conversations(self) -> None:
+        convs = self.engine.conversations()
+        if not convs:
+            QMessageBox.information(self, "Yaragon - conversations",
+                                   "No conversations captured yet.")
+            return
+        dlg = ConversationsDialog(convs, self)
+        dlg.follow_requested.connect(lambda a, b: self.traffic.proxy.set_pair((a, b)))
+        dlg.stream_requested.connect(self._open_stream)
+        self._show_modeless(dlg)
+
+    def _open_stream(self, a: str, b: str) -> None:
+        segments = reassemble(self.engine.conversation_packets(a, b), a, b)
+        self._show_modeless(FollowStreamDialog(a, b, segments, self))
+
+    def _open_target_intel(self, host: str) -> None:
+        intel = self.engine.target_intel(host)
+        self._show_modeless(TargetIntelDialog(intel, self))
+
     # ------------------------------------------------------------- tick
     def _on_tick(self) -> None:
         batch = self.engine.drain_new()
         if batch:
             self.traffic.append_batch(batch)
+        # Surface dropped frames honestly (a new capture starts at 0, so this
+        # clears itself when capture restarts).
+        dropped = self.capture.dropped if self.capture is not None else 0
+        if dropped:
+            self.dropped_lbl.setText(f"⚠ {dropped} dropped")
+            self.dropped_lbl.show()
+        else:
+            self.dropped_lbl.hide()
 
     # ---------------------------------------------------------- session
     def _clear_session(self) -> None:
@@ -676,9 +835,88 @@ class MainWindow(QMainWindow):
             self.traffic.clear()
             self.statusBar().showMessage("Cleared.")
 
+    # -------------------------------------------------------- signals
+    def install_signal_handlers(self) -> None:
+        """Restore the network on SIGINT/SIGTERM/SIGHUP. ``atexit`` does NOT run
+        on these (a kill / logout / terminal-close), so without this a
+        terminating Yaragon would leave ARP poisoned and the host forwarding.
+
+        Wired Qt-safely: the OS signal only writes a byte to a socketpair via
+        ``set_wakeup_fd``; a QSocketNotifier then delivers it on the Qt event
+        loop, where touching Qt + networking is safe (a raw signal handler must
+        not). SIGKILL and power loss cannot be caught in userspace - the short
+        ARP reassert interval lets a victim recover once the poisoner is gone.
+        """
+        import signal
+        import socket
+        try:
+            self._sig_rsock, self._sig_wsock = socket.socketpair()
+            self._sig_rsock.setblocking(False)
+            self._sig_wsock.setblocking(False)
+            self._sig_notifier = QSocketNotifier(
+                self._sig_rsock.fileno(), QSocketNotifier.Read, self)
+            self._sig_notifier.activated.connect(self._on_signal_wakeup)
+            signal.set_wakeup_fd(self._sig_wsock.fileno())
+            for signame in ("SIGINT", "SIGTERM", "SIGHUP"):
+                sig = getattr(signal, signame, None)
+                if sig is not None:
+                    # A no-op Python handler overrides the default terminate
+                    # action so the process lives long enough to clean up; the
+                    # wakeup fd nudges the event loop to run _on_signal_wakeup.
+                    signal.signal(sig, self._signal_stub)
+        except (ValueError, OSError) as exc:
+            # e.g. not on the main thread - degrade gracefully (atexit remains).
+            log.warning("Could not install signal handlers: %s", exc)
+
+    @staticmethod
+    def _signal_stub(signum, frame) -> None:
+        # Deliberately empty: the real work runs on the Qt event loop via the
+        # wakeup-fd notifier (a safe context), not in this async handler.
+        pass
+
+    def _on_signal_wakeup(self, *args) -> None:
+        try:
+            self._sig_rsock.recv(4096)
+        except OSError:
+            pass
+        log.info("Termination signal received - restoring network state and quitting")
+        self._graceful_quit()
+
+    def _graceful_quit(self) -> None:
+        """Run the same restore-and-teardown as a clean close, then quit."""
+        self.close()
+        QApplication.quit()
+
+    def _teardown_signal_handlers(self) -> None:
+        """Detach the wakeup fd and close the signal socketpair so a closed
+        window never leaves a dangling wakeup fd pointing at a dead socket."""
+        if getattr(self, "_sig_wsock", None) is None:
+            return
+        import signal
+        try:
+            signal.set_wakeup_fd(-1)
+        except Exception:
+            pass
+        # Restore default disposition so a second signal during a slow shutdown
+        # terminates promptly instead of being swallowed by the now-inert stub.
+        for signame in ("SIGINT", "SIGTERM", "SIGHUP"):
+            sig = getattr(signal, signame, None)
+            if sig is not None:
+                try:
+                    signal.signal(sig, signal.SIG_DFL)
+                except Exception:
+                    pass
+        for sock in ("_sig_rsock", "_sig_wsock"):
+            try:
+                getattr(self, sock).close()
+            except Exception:
+                pass
+        self._sig_wsock = None
+
     # -------------------------------------------------------- shutdown
     def closeEvent(self, event) -> None:
         log.info("Shutting down Yaragon…")
+        self._teardown_signal_handlers()
         try:
             self.timer.stop()
         except Exception:

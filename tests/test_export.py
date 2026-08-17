@@ -103,11 +103,11 @@ def test_import_pcap_skips_unparseable_frames(tmp_path, monkeypatch):
     real_parse = PacketParser.parse
     calls = {"n": 0}
 
-    def flaky_parse(self, pkt, number=0):
+    def flaky_parse(self, pkt, number=0, build_tree=True):
         calls["n"] += 1
         if calls["n"] == 3:                 # blow up on the third frame only
             raise ValueError("boom")
-        return real_parse(self, pkt, number)
+        return real_parse(self, pkt, number, build_tree)
 
     # import_pcap does a local `from ...packet_parser import PacketParser`, so it
     # resolves the same class object - patching the class attribute takes effect.

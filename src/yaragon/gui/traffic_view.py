@@ -1,10 +1,12 @@
-"""Traffic Monitor - the primary screen after MITM starts.
+"""Investigate - the heart screen where captured traffic is analysed.
 
-Layout: a slim, readable packet table on the left and an OSI/Hex/ASCII packet
-inspector on the right. Protocol filtering is a row of one-click chips; below
-them, dedicated Source IP / Destination IP boxes and a free-text search (which
-also filters by port when given a bare number) narrow the table. Updates are
-batched so the GUI never stalls under load.
+Layout: a slim, sortable packet table on the left and a Decoded/Hex inspector on
+the right. Protocol filtering is a row of MULTI-select chips; a free-text search
+(a bare number filters by port), Source/Destination IP boxes and right-click
+pivots narrow the table, with a live match count and an always-available clear.
+A small keyboard set drives the loop (/ focus search, Esc clear, F follow, 1-9
+chips). Conversations / Follow Stream / Target Intelligence open from here over
+the full engine history. Updates are batched so the GUI never stalls under load.
 """
 from __future__ import annotations
 
@@ -77,14 +79,30 @@ class TrafficModel(QAbstractTableModel):
                 if r.timestamp:
                     self._t0 = r.timestamp
                     break
-        over = len(self._rows) + len(records) - (self._rows.maxlen or 0)
-        if over > 0:
-            self.beginResetModel(); self._rows.extend(records); self.endResetModel()
+        # Grow past the cap by evicting the oldest rows and inserting the new
+        # ones (row remove/insert), never a full model reset - a long capture
+        # would otherwise reset on every drain, losing selection and churning the
+        # inspector. The rows are references to the engine's PacketRecords.
+        maxlen = self._rows.maxlen
+        incoming = len(records)
+        cur = len(self._rows)
+        if maxlen:
+            total_after = min(cur + incoming, maxlen)
+            evict = min(cur + incoming - total_after, cur)
         else:
-            start = len(self._rows)
-            self.beginInsertRows(QModelIndex(), start, start + len(records) - 1)
-            self._rows.extend(records)
-            self.endInsertRows()
+            evict = 0
+        if evict:
+            self.beginRemoveRows(QModelIndex(), 0, evict - 1)
+            for _ in range(evict):
+                self._rows.popleft()
+            self.endRemoveRows()
+        # If one batch is larger than the whole table, only its tail survives -
+        # insert exactly the rows that will remain so the row count stays honest.
+        to_insert = records[-maxlen:] if (maxlen and incoming > maxlen) else records
+        start = len(self._rows)
+        self.beginInsertRows(QModelIndex(), start, start + len(to_insert) - 1)
+        self._rows.extend(records)   # deque auto-trims to maxlen
+        self.endInsertRows()
 
     def record_at(self, row: int) -> Optional[PacketRecord]:
         return self._rows[row] if 0 <= row < len(self._rows) else None
@@ -96,14 +114,28 @@ class TrafficModel(QAbstractTableModel):
 class TrafficProxy(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.proto = "All"
+        self.protos: set = set()   # empty = all protocols; else a union filter
         self.text = ""
         self.src_ip = ""
         self.dst_ip = ""
         self.pair = None   # frozenset{A, B} - "follow conversation" both ways
 
     def set_proto(self, proto: str):
-        self.proto = proto; self.invalidate()
+        """Replace the protocol filter with a single protocol ('All'/'' = clear).
+        Used programmatically; the chip UI uses toggle_proto for multi-select."""
+        self.protos = set() if proto in ("All", "", None) else {proto}
+        self.invalidate()
+
+    def toggle_proto(self, proto: str):
+        """Multi-select: add/remove one protocol from the union filter. 'All'
+        clears the set so every protocol shows."""
+        if proto in ("All", "", None):
+            self.protos = set()
+        elif proto in self.protos:
+            self.protos.discard(proto)
+        else:
+            self.protos.add(proto)
+        self.invalidate()
 
     def set_pair(self, pair):
         """Follow one A<->B conversation: keep only packets whose endpoints are
@@ -120,14 +152,40 @@ class TrafficProxy(QSortFilterProxyModel):
     def set_dst_ip(self, text: str):
         self.dst_ip = text.lower().strip(); self.invalidate()
 
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
+        """Sort by the record's typed field for the clicked column, so numeric
+        columns (# / Time / Length) sort numerically, not lexicographically."""
+        model: TrafficModel = self.sourceModel()
+        a = model.record_at(left.row())
+        b = model.record_at(right.row())
+        if a is None or b is None:
+            return False
+        col = left.column()
+        if col == 0:
+            return a.number < b.number
+        if col == 1:
+            return (a.timestamp or 0.0) < (b.timestamp or 0.0)
+        if col == 2:
+            return a.protocol < b.protocol
+        if col == 3:
+            return (a.src_ip, a.src_port or 0) < (b.src_ip, b.src_port or 0)
+        if col == 4:
+            return (a.dst_ip, a.dst_port or 0) < (b.dst_ip, b.dst_port or 0)
+        if col == 5:
+            return a.length < b.length
+        if col == 6:
+            return a.info < b.info
+        return a.number < b.number
+
     def filterAcceptsRow(self, row: int, parent: QModelIndex) -> bool:
         model: TrafficModel = self.sourceModel()
         rec = model.record_at(row)
         if rec is None:
             return False
-        if self.proto != "All" and rec.protocol != self.proto:
+        if self.protos and rec.protocol not in self.protos:
             return False
-        if self.pair is not None and frozenset((rec.src_ip, rec.dst_ip)) != self.pair:
+        if self.pair is not None and frozenset(
+                (rec.src_ip or rec.src_mac, rec.dst_ip or rec.dst_mac)) != self.pair:
             return False
         if self.src_ip and self.src_ip not in rec.src_ip.lower():
             return False
@@ -154,6 +212,10 @@ class TrafficView(QWidget):
     clear_requested = Signal()          # clear displayed traffic from this session
     export_requested = Signal()         # save the capture to a .pcap file
     open_requested = Signal()           # open a saved .pcap for offline inspection
+    conversations_requested = Signal()  # open the flow-triage Conversations view
+    follow_stream_requested = Signal(str, str)   # reassemble a flow (a, b)
+    target_intel_requested = Signal(str)         # per-host intelligence rollup
+    sample_requested = Signal()         # load the bundled sample capture
 
     def __init__(self, limit: int = 5000, parent=None):
         super().__init__(parent)
@@ -179,8 +241,13 @@ class TrafficView(QWidget):
         self.pause_btn.setToolTip("Pause capture - captured packets are kept")
         self.stop_btn = QPushButton("Stop"); self.stop_btn.setObjectName("Danger")
         self.stop_btn.setToolTip("Stop the capture session - captured packets are kept")
-        self.clear_btn = QPushButton("Clear"); self.clear_btn.setObjectName("Ghost")
-        self.clear_btn.setToolTip("Clear the displayed traffic from this session")
+        self.conv_btn = QPushButton("Conversations"); self.conv_btn.setObjectName("Ghost")
+        self.conv_btn.setToolTip("Triage the capture as endpoint-pair flows "
+                                 "(packets, bytes, protocols) - open one to follow it")
+        self.clear_btn = QPushButton("Clear packets")
+        self.clear_btn.setObjectName("Ghost")
+        self.clear_btn.setToolTip("Discard the captured packets from this session "
+                                  "(distinct from clearing display filters)")
         self.export_btn = QPushButton("Export .pcap")
         self.export_btn.setToolTip("Save the captured packets to a .pcap file "
                                    "(open in Wireshark, tcpdump, …)")
@@ -204,20 +271,21 @@ class TrafficView(QWidget):
         controls.addSpacing(8)
         controls.addWidget(self.bpf_box)
         controls.addStretch(1)
+        controls.addWidget(self.conv_btn)
         controls.addWidget(self.clear_btn)
         controls.addWidget(self.export_btn)
         root.addLayout(controls)
 
         # row 2: protocol filter chips
+        # Protocol chips are MULTI-select (view TCP + TLS + DNS together): the
+        # group is non-exclusive and each chip toggles its protocol in the union.
+        # "All" is the reset - it clears the union and any followed conversation.
         bar = QHBoxLayout(); bar.setSpacing(6)
-        self._chip_group = QButtonGroup(self); self._chip_group.setExclusive(True)
+        self._chip_group = QButtonGroup(self); self._chip_group.setExclusive(False)
         for i, name in enumerate(CHIPS):
             chip = QPushButton(name); chip.setCheckable(True); chip.setObjectName("Chip")
             self._style_chip(chip, name)
-            chip.clicked.connect(lambda _=False, n=name: self.proxy.set_proto(n))
-            if name == "All":
-                # "All" is the reset: it also clears a followed conversation.
-                chip.clicked.connect(lambda _=False: self.proxy.set_pair(None))
+            chip.clicked.connect(lambda _=False, n=name: self._on_chip_clicked(n))
             self._chip_group.addButton(chip, i)
             bar.addWidget(chip)
             if i == 0:
@@ -236,8 +304,17 @@ class TrafficView(QWidget):
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search info · type a number to filter by port (e.g. 443)")
         self.search.setClearButtonEnabled(True)
+        # A dim match count ("shown / total") and an always-available clear so the
+        # operator can always see how hard a filter bit and step back out of it.
+        self.match_lbl = QLabel(""); self.match_lbl.setObjectName("Dim")
+        self.clear_inline_btn = QPushButton("Clear (Esc)")
+        self.clear_inline_btn.setObjectName("Ghost")
+        self.clear_inline_btn.setToolTip("Clear all display filters")
+        self.clear_inline_btn.hide()
         filters.addWidget(self.src_filter); filters.addWidget(self.dst_filter)
         filters.addWidget(self.search, 1)
+        filters.addWidget(self.match_lbl)
+        filters.addWidget(self.clear_inline_btn)
         root.addLayout(filters)
 
         # Inline "filter matches nothing" line - without it, a filter that hides
@@ -260,7 +337,10 @@ class TrafficView(QWidget):
         self.proxy = TrafficProxy(); self.proxy.setSourceModel(self.model)
         self.table = QTableView(); self.table.setModel(self.proxy)
         self.table.setSelectionBehavior(QTableView.SelectRows)
-        self.table.setSelectionMode(QTableView.SingleSelection)
+        # Range/extended selection so an operator can hand-pick a subset (e.g. to
+        # export just those packets), not only whole filters.
+        self.table.setSelectionMode(QTableView.ExtendedSelection)
+        self.table.setSortingEnabled(True)   # click a header to sort (see lessThan)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
@@ -275,10 +355,13 @@ class TrafficView(QWidget):
         self.table_stack = QStackedWidget()
         self._empty = EmptyState(
             "No packets yet",
-            "Press Start to capture, or open a saved .pcap to inspect it offline.",
+            "Press Start to capture, load the sample to explore offline, or open "
+            "a saved .pcap.",
             icon="≣",
-            action_text="Open .pcap…",
-            on_action=self.open_requested.emit)
+            action_text="Load sample capture",
+            on_action=self.sample_requested.emit,
+            action2_text="Open .pcap…",
+            on_action2=self.open_requested.emit)
         self.table_stack.addWidget(self._empty)
         self.table_stack.addWidget(self.table)
         self.table_stack.setCurrentWidget(self._empty)
@@ -290,7 +373,15 @@ class TrafficView(QWidget):
         split.setSizes([780, 460])
         root.addWidget(split, 1)
 
-        self.search.textChanged.connect(self.proxy.set_text)
+        # Debounce the free-text search: filtering re-scans the whole history, so
+        # coalesce keystrokes into one pass (~150ms) instead of one per key.
+        from PySide6.QtCore import QTimer
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(150)
+        self._search_timer.timeout.connect(
+            lambda: self.proxy.set_text(self.search.text()))
+        self.search.textChanged.connect(lambda _t: self._search_timer.start())
         self.src_filter.textChanged.connect(self.proxy.set_src_ip)
         self.dst_filter.textChanged.connect(self.proxy.set_dst_ip)
         self.start_btn.clicked.connect(self.start_requested.emit)
@@ -298,16 +389,98 @@ class TrafficView(QWidget):
         self.stop_btn.clicked.connect(self.stop_requested.emit)
         self.clear_btn.clicked.connect(self.clear_requested.emit)
         self.export_btn.clicked.connect(self.export_requested.emit)
+        self.conv_btn.clicked.connect(self.conversations_requested.emit)
         self.table.selectionModel().selectionChanged.connect(self._on_select)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._table_context_menu)
         self.clear_filters_btn.clicked.connect(self._clear_filters)
+        self.clear_inline_btn.clicked.connect(self._clear_filters)
         for sig in (self.proxy.layoutChanged, self.proxy.modelReset,
                     self.proxy.rowsInserted, self.proxy.rowsRemoved):
             sig.connect(self._update_filter_empty)
+            sig.connect(self._update_match_count)
         self._has_packets = False
         self._state = "idle"
+        self._install_shortcuts()
         self.set_capture_state("idle")
+
+    # ---- expert-operator layer --------------------------------------
+    def _install_shortcuts(self) -> None:
+        """A small, high-value keyboard set for the investigation loop.
+
+        Single-key (printable) shortcuts are scoped to the packet TABLE
+        (Qt.WidgetShortcut), so they only fire when the table has focus and can
+        NEVER hijack typing in the search / IP fields (you can still type '/' in a
+        path or a CIDR). Ctrl-modified shortcuts are window-wide since they can't
+        collide with plain typing."""
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QKeySequence, QShortcut
+
+        def table_sc(seq, handler):
+            s = QShortcut(QKeySequence(seq), self.table)
+            s.setContext(Qt.WidgetShortcut)   # only when the table has focus
+            s.activated.connect(handler)
+            return s
+
+        def win_sc(seq, handler):
+            s = QShortcut(QKeySequence(seq), self)
+            s.activated.connect(handler)
+            return s
+
+        win_sc("Ctrl+F", self._focus_search)   # jump to search from anywhere
+        table_sc("/", self._focus_search)
+        table_sc("Esc", self._clear_filters)
+        table_sc("F", self.follow_selected)
+        for i in range(1, len(CHIPS)):          # 1..8 -> protocol chips
+            table_sc(str(i), lambda idx=i: self._toggle_chip_by_index(idx))
+        table_sc("0", lambda: self._toggle_chip_by_index(0))   # 0 -> All (reset)
+
+    def _typing_in_field(self) -> bool:
+        w = QApplication.focusWidget()
+        return isinstance(w, QLineEdit)
+
+    def _focus_search(self) -> None:
+        self.search.setFocus()
+        self.search.selectAll()
+
+    def _toggle_chip_by_index(self, idx: int) -> None:
+        if self._typing_in_field():
+            return
+        btn = self._chip_group.button(idx)
+        if btn is not None:
+            btn.animateClick()
+
+    def follow_selected(self) -> None:
+        """Follow the conversation of the selected row (A ↔ B). Bound to 'F'."""
+        if self._typing_in_field():
+            return
+        idx = self.table.selectionModel().currentIndex()
+        if not idx.isValid():
+            return
+        rec = self.model.record_at(self.proxy.mapToSource(idx).row())
+        if rec and rec.src_ip and rec.dst_ip and rec.src_ip != rec.dst_ip:
+            self.proxy.set_pair((rec.src_ip, rec.dst_ip))
+
+    def _on_chip_clicked(self, name: str) -> None:
+        """Chip toggled: 'All' resets everything; a specific chip toggles its
+        protocol in the union and unchecks 'All'."""
+        all_btn = self._chip_group.button(0)
+        if name == "All":
+            self.proxy.toggle_proto("All")     # clear the union
+            self.proxy.set_pair(None)
+            for b in self._chip_group.buttons():
+                b.setChecked(b is all_btn)
+        else:
+            self.proxy.toggle_proto(name)
+            if all_btn is not None:
+                all_btn.setChecked(not self.proxy.protos)
+
+    def _update_match_count(self, *args) -> None:
+        shown = self.proxy.rowCount()
+        total = self.model.rowCount()
+        active = self.is_filter_active()
+        self.match_lbl.setText(f"{shown} / {total}" if active else "")
+        self.clear_inline_btn.setVisible(active)
 
     def set_has_packets(self, has: bool) -> None:
         """Gate the contextual Clear / Export actions: they only make sense once
@@ -318,8 +491,10 @@ class TrafficView(QWidget):
 
     def _update_data_actions(self) -> None:
         offline = self._state == "offline"
-        self.clear_btn.setEnabled(offline or self._has_packets)
-        self.export_btn.setEnabled(offline or self._has_packets)
+        has = offline or self._has_packets
+        self.clear_btn.setEnabled(has)
+        self.export_btn.setEnabled(has)
+        self.conv_btn.setEnabled(has)
 
     def set_capture_state(self, state: str) -> None:
         """Reflect the real capture state as a contextual control set (DESIGN
@@ -349,7 +524,7 @@ class TrafficView(QWidget):
         self.bpf_box.setVisible(idle)
 
         # Contextual session-data actions.
-        self.clear_btn.setText("Close file" if offline else "Clear")
+        self.clear_btn.setText("Close file" if offline else "Clear packets")
         self._update_data_actions()
 
     def _style_chip(self, chip: QPushButton, name: str):
@@ -384,22 +559,23 @@ class TrafficView(QWidget):
         self.filter_empty.setVisible(active and empty)
 
     def _clear_filters(self) -> None:
-        """Reset every display filter (proto chip, IP boxes, search, followed
+        """Reset every display filter (proto chips, IP boxes, search, followed
         conversation) so the full capture is visible again."""
         self.src_filter.clear()
         self.dst_filter.clear()
         self.search.clear()
         self.proxy.set_pair(None)
-        self.proxy.set_proto("All")
-        btn = self._chip_group.button(0)
-        if btn is not None:
-            btn.setChecked(True)
+        self.proxy.set_proto("All")            # clears the protocol union
+        all_btn = self._chip_group.button(0)
+        for b in self._chip_group.buttons():
+            b.setChecked(b is all_btn)
         self._update_filter_empty()
+        self._update_match_count()
 
     def is_filter_active(self) -> bool:
         """True when any display filter (proto chip, src/dst IP, search) narrows
         the table below the full capture."""
-        return (self.proxy.proto != "All" or bool(self.proxy.src_ip)
+        return (bool(self.proxy.protos) or bool(self.proxy.src_ip)
                 or bool(self.proxy.dst_ip) or bool(self.proxy.text)
                 or self.proxy.pair is not None)
 
@@ -419,6 +595,13 @@ class TrafficView(QWidget):
         self.subtitle.setText(
             f"Offline - {count} packet(s) loaded from {os.path.basename(path)}.")
 
+    def set_sample_loaded(self, count: int) -> None:
+        """Reflect that the bundled SAMPLE capture is loaded - clearly synthetic,
+        never presented as live traffic."""
+        self.subtitle.setText(
+            f"SAMPLE CAPTURE - {count} synthetic packet(s) for learning "
+            f"(not live traffic).")
+
     # ---- packets -----------------------------------------------------
     def append_batch(self, records: List[PacketRecord]) -> None:
         if not records:
@@ -430,7 +613,15 @@ class TrafficView(QWidget):
         self.model.append_batch(records)
         if not self._has_packets:
             self.set_has_packets(True)
-        if at_bottom:
+        # Only auto-follow the tail in the natural capture order: unsorted, or
+        # sorted ascending by '#'. Any other column - or '#' descending
+        # (newest-first at the top) - means the tail is not at the bottom, so
+        # don't yank the viewport.
+        header = self.table.horizontalHeader()
+        section = header.sortIndicatorSection()
+        ascending = header.sortIndicatorOrder() == Qt.AscendingOrder
+        natural_order = section == -1 or (section == 0 and ascending)
+        if at_bottom and natural_order:
             self.table.scrollToBottom()
 
     # ---- context menu (pivot & copy) ---------------------------------
@@ -472,6 +663,18 @@ class TrafficView(QWidget):
                 f"Follow conversation  ({rec.src_ip} ↔ {rec.dst_ip})")
             a.triggered.connect(
                 lambda _=False, s=rec.src_ip, d=rec.dst_ip: self.proxy.set_pair((s, d)))
+            a = menu.addAction(
+                f"Follow stream  ({rec.src_ip} ↔ {rec.dst_ip})…")
+            a.triggered.connect(
+                lambda _=False, s=rec.src_ip, d=rec.dst_ip:
+                self.follow_stream_requested.emit(s, d))
+        if rec.src_ip or rec.dst_ip:
+            menu.addSeparator()
+            for ip in (rec.src_ip, rec.dst_ip):
+                if ip:
+                    a = menu.addAction(f"Target intelligence  ({ip})…")
+                    a.triggered.connect(
+                        lambda _=False, host=ip: self.target_intel_requested.emit(host))
         return menu
 
     def _on_select(self):

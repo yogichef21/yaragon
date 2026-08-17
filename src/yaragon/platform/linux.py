@@ -8,8 +8,8 @@ import subprocess
 from typing import Dict, List, Optional
 
 from ..utils.logging import get_logger
-from .base import (ForwardingController, InterfaceInfo, PlatformAdapter,
-                   PrivilegeStatus)
+from .base import (ForwardingController, ForwardingPreflight, InterfaceInfo,
+                   PlatformAdapter, PrivilegeStatus)
 
 log = get_logger("platform.linux")
 
@@ -22,6 +22,52 @@ def _run(cmd: List[str]) -> str:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
     except Exception:
         return ""
+
+
+def _forward_policy() -> str:
+    """Return the netfilter FORWARD chain default policy as 'accept' | 'drop' |
+    'unknown'. 'unknown' is the honest answer when the tables can't be read
+    (the normal cap_net_raw-only case) - we then warn rather than false-block.
+
+    Reading iptables/nft usually needs privilege; a failure yields "" from _run
+    and falls through to 'unknown'. No shell is used (argv only)."""
+    # iptables front-end covers both the legacy and nft backends on modern
+    # distros; its first -S line states the chain policy.
+    out = _run(["iptables", "-S", "FORWARD"])
+    for line in out.splitlines():
+        if line.startswith("-P FORWARD "):
+            verb = line.split()[2].upper()
+            if verb == "ACCEPT":
+                return "accept"
+            if verb in ("DROP", "REJECT"):
+                return "drop"
+    # Pure-nftables hosts (no iptables shim): read the ruleset for a forward hook.
+    nft = _run(["nft", "list", "ruleset"]).lower()
+    if "hook forward" in nft:
+        # Find the policy token that follows the forward hook declaration.
+        idx = nft.find("hook forward")
+        window = nft[idx:idx + 200]
+        if "policy drop" in window:
+            return "drop"
+        if "policy accept" in window:
+            return "accept"
+    return "unknown"
+
+
+def _rp_filter_effective(iface: str) -> Optional[int]:
+    """Effective reverse-path filter for *iface*: the kernel uses max(all, iface).
+    0 = off, 1 = strict, 2 = loose. Returns None if it can't be read (these
+    /proc/sys files are world-readable, so that is rare)."""
+    def _read_int(path: str) -> Optional[int]:
+        try:
+            with open(path) as fh:
+                return int(fh.read().strip())
+        except Exception:
+            return None
+    all_rp = _read_int("/proc/sys/net/ipv4/conf/all/rp_filter")
+    if_rp = _read_int(f"/proc/sys/net/ipv4/conf/{iface}/rp_filter")
+    vals = [v for v in (all_rp, if_rp) if v is not None]
+    return max(vals) if vals else None
 
 
 class LinuxForwarding(ForwardingController):
@@ -98,14 +144,63 @@ class LinuxForwarding(ForwardingController):
                 self._changed_v6 = True
         return True
 
-    def restore(self) -> None:
+    def restore(self) -> bool:
+        """Restore the original forwarding sysctls. Returns True only if every
+        needed write succeeded; on failure the changed-flag is kept so a later
+        restore (e.g. atexit) retries, and the caller reports the failure rather
+        than claiming the host was cleaned up."""
+        ok = True
         if self._changed_v4 and self._orig_v4 is not None:
-            self._write(IPV4_FWD, self._orig_v4)
-            self._changed_v4 = False
-            log.info("Restored IPv4 forwarding to %s", self._orig_v4)
+            if self._write(IPV4_FWD, self._orig_v4):
+                self._changed_v4 = False
+                log.info("Restored IPv4 forwarding to %s", self._orig_v4)
+            else:
+                ok = False
+                log.warning("Failed to restore IPv4 forwarding to %s (host may "
+                            "still be forwarding)", self._orig_v4)
         if self._changed_v6 and self._orig_v6 is not None:
-            self._write(IPV6_FWD, self._orig_v6)
-            self._changed_v6 = False
+            if self._write(IPV6_FWD, self._orig_v6):
+                self._changed_v6 = False
+            else:
+                ok = False
+        return ok
+
+    def preflight(self, iface_name: str) -> ForwardingPreflight:
+        """Check that forwarded traffic will actually be *relayed*, not dropped.
+        Enabling ``ip_forward`` is necessary but not sufficient: a netfilter
+        FORWARD policy of DROP (ufw / firewalld / a Docker host) black-holes the
+        target. We fail closed only on a positive DROP finding; an unreadable
+        policy is surfaced as unverified, never a false block. Yaragon makes NO
+        firewall changes - it only detects and reports."""
+        policy = _forward_policy()
+        rp = _rp_filter_effective(iface_name)
+
+        checks = []
+        forward_passed = {"accept": True, "drop": False}.get(policy)  # None if unknown
+        checks.append((
+            "FORWARD policy relays traffic", forward_passed,
+            {"accept": "ACCEPT", "drop": "DROP/REJECT"}.get(policy, "could not read (needs privilege)")))
+
+        if rp is None:
+            rp_passed = None
+            rp_detail = "could not read"
+        elif rp == 1:
+            rp_passed = False
+            rp_detail = "strict (1) - may drop asymmetrically-routed relayed traffic"
+        else:
+            rp_passed = True
+            rp_detail = {0: "off (0)", 2: "loose (2)"}.get(rp, str(rp))
+        checks.append(("Reverse-path filter (rp_filter) not strict", rp_passed, rp_detail))
+
+        blocked = policy == "drop"
+        reason = ""
+        if blocked:
+            reason = ("The netfilter FORWARD policy is DROP - forwarded traffic "
+                      "would be black-holed instead of relayed. Allow forwarding "
+                      "for the target and gateway (e.g. a FORWARD ACCEPT rule) or "
+                      "turn off IP-forwarding management, then retry.")
+        return ForwardingPreflight(ok=not blocked, blocked=blocked,
+                                   reason=reason, checks=checks)
 
 
 class LinuxAdapter(PlatformAdapter):
